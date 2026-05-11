@@ -1,0 +1,17 @@
+[package]
+name = "credential_registry"
+version = "0.1.0"
+edition = "2021"
+
+# This contract will manage the on-chain registry of verifiable credentials.
+# It stores credential hashes, issuer/holder addresses, timestamps, and
+# revocation status. Credential content itself lives on IPFS.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
