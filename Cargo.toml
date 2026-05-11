@@ -1,0 +1,30 @@
+# Root Cargo workspace for OpenCred smart contracts.
+#
+# This workspace is designed to scale as new Soroban contracts are added.
+# Each contract lives under contracts/<contract_name>/ and is listed here.
+#
+# To add a new contract:
+#   1. Create contracts/<name>/Cargo.toml and contracts/<name>/src/lib.rs
+#   2. Add "contracts/<name>" to the members list below.
+
+[workspace]
+resolver = "2"
+members = [
+    "contracts/credential_registry",
+]
+
+# Shared dependency versions — pin here to keep all contracts in sync.
+[workspace.dependencies]
+soroban-sdk = { version = "22.0.0" }
+
+# Release profile shared across all contracts.
+# Optimised for minimal WASM binary size.
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
