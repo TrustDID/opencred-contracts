@@ -1,0 +1,16 @@
+# CODEOWNERS
+# Each line is a file pattern followed by one or more owners.
+# Owners are notified when a PR touches matching files.
+
+# Default owner for everything
+* @TrustDID/maintainers
+
+# Core contract logic
+/contracts/ @TrustDID/maintainers
+
+# Documentation
+/docs/ @TrustDID/maintainers
+*.md @TrustDID/maintainers
+
+# GitHub configuration
+/.github/ @TrustDID/maintainers
