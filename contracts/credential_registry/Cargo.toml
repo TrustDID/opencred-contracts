@@ -8,10 +8,16 @@ edition = "2021"
 # revocation status. Credential content itself lives on IPFS.
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib  — required for Soroban WASM compilation
+# rlib    — required so that integration test binaries can link against the crate
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+
+[[test]]
+name = "integration_tests"
+path = "test/integration_tests.rs"
