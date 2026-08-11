@@ -8,7 +8,13 @@ edition = "2021"
 # revocation status. Credential content itself lives on IPFS.
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+# Integration tests live in test/ per CONTRIBUTING.md. Declared explicitly
+# because cargo only auto-discovers tests/ (plural) by default.
+[[test]]
+name = "integration_tests"
+path = "test/integration_tests.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
