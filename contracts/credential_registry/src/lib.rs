@@ -5,238 +5,166 @@
 //!
 //! ## Credential Lifecycle
 //!
-//! 1. **Issuance** — An authorized issuer calls [`CredentialRegistry::issue_credential`]
-//!    with a unique `credential_id`, their own address as the issuer, the holder's
-//!    address, and the IPFS CID of the credential document.  The contract records
-//!    the metadata and the ledger timestamp.  The full credential document is stored
-//!    off-chain on IPFS; the contract stores only the CID.
+//! 1. **Issuance** — An issuer submits a credential hash along with the
+//!    holder's address. The contract records the hash, issuer, holder, and a
+//!    ledger timestamp. The full credential document is stored off-chain on IPFS.
 //!
 //! 2. **Verification** — Any caller can call [`CredentialRegistry::get_credential`]
 //!    with a `credential_id` to confirm it was issued, retrieve the holder address,
 //!    and check that it has not been revoked.
 //!
-//! 3. **Revocation** — The original issuer calls [`CredentialRegistry::revoke_credential`]
-//!    to permanently mark their credential as revoked.  Revocation is irreversible.
+//! 3. **Revocation** — The original issuer can mark a credential hash as
+//!    revoked. Revocation is permanent and on-chain.
 //!
 //! ## Storage Design
 //!
-//! All entries live in Soroban **persistent** storage so they survive ledger
-//! archival of the contract's footprint.
+//! Each credential is stored in Soroban persistent storage keyed by its hash:
 //!
-//! Storage layout:
-//! - Key: `StorageKey::Credential(credential_id: Bytes)`
-//!   → Value: [`CredentialRecord`]
+//! ```text
+//! CredentialKey { hash } → CredentialRecord { hash, issuer, holder, issued_at, revoked }
+//! ```
 //!
-//! ## Security Model
+//! The hash is the content hash of the credential document (e.g. an IPFS CID),
+//! so tampering with the document breaks the link. See `docs/ARCHITECTURE.md`.
 //!
-//! - `issue_credential` calls `issuer.require_auth()` — only the declared issuer
-//!   can submit the transaction.
-//! - `revoke_credential` calls `issuer.require_auth()` and checks that the caller
-//!   is the original issuer stored in the record.
-//! - `get_credential` is permissionless (read-only).
-//! - No admin key exists; there is no privileged account that can alter credentials
-//!   belonging to other issuers.
+//! ## Authorization
+//!
+//! - `register_credential` and `revoke_credential` authenticate the caller via
+//!   `Address::require_auth`.
+//! - Only the issuer that registered a credential can revoke it. There is no
+//!   privileged admin key — the registry is decentralized by design.
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, Env};
 
-// ---------------------------------------------------------------------------
-// Error codes
-// ---------------------------------------------------------------------------
-
-/// Contract-level error codes returned as `u32` panic values via
-/// `env.panic_with_error()` / `panic!`.
-///
-/// Clients should match on these values when catching contract errors.
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Errors returned by the Credential Registry contract.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum ContractError {
-    /// A credential with the given `credential_id` already exists.
-    CredentialAlreadyExists = 1,
-    /// No credential found for the given `credential_id`.
-    CredentialNotFound = 2,
-    /// Caller is not the original issuer of this credential.
-    UnauthorizedIssuer = 3,
-    /// The credential has already been revoked.
+pub enum CredentialError {
+    /// A credential with the same hash is already registered.
+    AlreadyRegistered = 1,
+    /// No credential exists for the given hash.
+    NotFound = 2,
+    /// The caller is not authorized to perform the operation.
+    Unauthorized = 3,
+    /// The credential is already revoked; revocation is permanent.
     AlreadyRevoked = 4,
 }
 
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-/// Soroban storage key.
-///
-/// Using an enum with a `Bytes` variant keeps keys human-readable in ledger
-/// explorers and avoids collision if more key types are added in the future.
+/// Storage key for a credential, keyed by its content hash.
 #[contracttype]
-#[derive(Clone)]
-pub enum StorageKey {
-    /// Persistent credential record keyed by `credential_id`.
-    Credential(Bytes),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialKey {
+    pub hash: Bytes,
 }
 
-/// On-chain representation of a single verifiable credential entry.
-///
-/// The full credential document lives on IPFS; only the CID is stored here.
-/// All fields are immutable after issuance, except `revoked` which transitions
-/// `false → true` exactly once.
+/// On-chain record for a single credential.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialRecord {
-    /// Stellar address of the entity that issued the credential.
+    /// Content hash of the credential document (e.g. an IPFS CID).
+    pub hash: Bytes,
+    /// Stellar address of the issuing organization.
     pub issuer: Address,
-    /// Stellar address of the credential holder / subject.
+    /// Stellar address of the credential subject.
     pub holder: Address,
-    /// IPFS CIDv1 (as raw bytes) pointing to the off-chain credential document.
-    pub ipfs_cid: Bytes,
-    /// Ledger timestamp (Unix seconds) at the time of issuance.
+    /// Ledger timestamp at issuance.
     pub issued_at: u64,
-    /// `true` if the credential has been permanently revoked by the issuer.
+    /// Whether the credential has been revoked. Revocation is permanent.
     pub revoked: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
-
+/// The OpenCred Credential Registry contract.
 #[contract]
 pub struct CredentialRegistry;
 
 #[contractimpl]
 impl CredentialRegistry {
-    // -----------------------------------------------------------------------
-    // Issuance
-    // -----------------------------------------------------------------------
-
-    /// Issue a new credential and record it on-chain.
+    /// Register a new credential on behalf of the authenticated issuer.
     ///
     /// # Arguments
     ///
-    /// * `env`           – Soroban host environment.
-    /// * `credential_id` – Unique identifier for this credential (e.g. a UUID
-    ///                     or content hash supplied by the issuer's tooling).
-    /// * `issuer`        – Address of the issuing party.  The transaction must
-    ///                     be signed by this address (`require_auth` is called).
-    /// * `holder`        – Address of the credential subject / holder.
-    /// * `ipfs_cid`      – IPFS CID of the full credential document stored
-    ///                     off-chain.
+    /// * `issuer` — Stellar address of the issuing organization. Must sign the
+    ///   transaction.
+    /// * `holder` — Stellar address of the credential subject.
+    /// * `hash` — Content hash of the credential document.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// * [`ContractError::CredentialAlreadyExists`] if `credential_id` is
-    ///   already recorded in persistent storage.
-    ///
-    /// # Storage
-    ///
-    /// Writes a [`CredentialRecord`] to persistent storage under
-    /// `StorageKey::Credential(credential_id)`.  The `issued_at` timestamp is
-    /// taken from the current ledger via `env.ledger().timestamp()`.
-    pub fn issue_credential(
+    /// Returns [`CredentialError::AlreadyRegistered`] if a credential with the
+    /// same hash already exists.
+    pub fn register_credential(
         env: Env,
-        credential_id: Bytes,
         issuer: Address,
         holder: Address,
-        ipfs_cid: Bytes,
-    ) {
-        // Authenticate: the declared issuer must have signed this transaction.
+        hash: Bytes,
+    ) -> Result<CredentialRecord, CredentialError> {
         issuer.require_auth();
 
-        let key = StorageKey::Credential(credential_id.clone());
+        let key = CredentialKey { hash: hash.clone() };
 
-        // Prevent duplicate issuance.
         if env.storage().persistent().has(&key) {
-            panic!("credential already exists");
+            return Err(CredentialError::AlreadyRegistered);
         }
 
         let record = CredentialRecord {
-            issuer,
+            hash,
+            issuer: issuer.clone(),
             holder,
-            ipfs_cid,
             issued_at: env.ledger().timestamp(),
             revoked: false,
         };
 
         env.storage().persistent().set(&key, &record);
+
+        Ok(record)
     }
 
-    // -----------------------------------------------------------------------
-    // Revocation
-    // -----------------------------------------------------------------------
+    /// Look up a credential by its content hash.
+    ///
+    /// Returns `None` when no credential with the given hash is registered.
+    pub fn get_credential(env: Env, hash: Bytes) -> Option<CredentialRecord> {
+        env.storage().persistent().get(&CredentialKey { hash })
+    }
 
-    /// Permanently revoke a previously issued credential.
+    /// Permanently revoke a credential. Only the issuer that registered it may
+    /// revoke it.
     ///
-    /// Only the original issuer of the credential may call this function.
-    /// Revocation is irreversible: once `revoked` is set to `true` it cannot
-    /// be cleared.
+    /// # Errors
     ///
-    /// # Arguments
-    ///
-    /// * `env`           – Soroban host environment.
-    /// * `credential_id` – Identifier of the credential to revoke.
-    /// * `issuer`        – Address of the issuer requesting revocation.  Must
-    ///                     match the issuer stored in the credential record.
-    ///
-    /// # Panics
-    ///
-    /// * [`ContractError::CredentialNotFound`] if no credential exists for the
-    ///   given `credential_id`.
-    /// * [`ContractError::UnauthorizedIssuer`] if `issuer` does not match the
-    ///   stored issuer.
-    /// * [`ContractError::AlreadyRevoked`] if the credential is already revoked.
-    pub fn revoke_credential(env: Env, credential_id: Bytes, issuer: Address) {
-        // Authenticate: the caller must have signed as the declared issuer.
+    /// * [`CredentialError::NotFound`] if the hash is not registered.
+    /// * [`CredentialError::Unauthorized`] if the caller is not the original
+    ///   issuer.
+    /// * [`CredentialError::AlreadyRevoked`] if the credential is already
+    ///   revoked.
+    pub fn revoke_credential(
+        env: Env,
+        issuer: Address,
+        hash: Bytes,
+    ) -> Result<CredentialRecord, CredentialError> {
         issuer.require_auth();
 
-        let key = StorageKey::Credential(credential_id);
+        let key = CredentialKey { hash };
 
         let mut record: CredentialRecord = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or_else(|| panic!("credential not found"));
+            .ok_or(CredentialError::NotFound)?;
 
         if record.issuer != issuer {
-            panic!("unauthorized issuer");
+            return Err(CredentialError::Unauthorized);
         }
 
         if record.revoked {
-            panic!("credential already revoked");
+            return Err(CredentialError::AlreadyRevoked);
         }
 
         record.revoked = true;
         env.storage().persistent().set(&key, &record);
-    }
 
-    // -----------------------------------------------------------------------
-    // Verification
-    // -----------------------------------------------------------------------
-
-    /// Retrieve a credential record by its identifier.
-    ///
-    /// This function is permissionless — any caller may verify a credential.
-    ///
-    /// # Arguments
-    ///
-    /// * `env`           – Soroban host environment.
-    /// * `credential_id` – Identifier of the credential to look up.
-    ///
-    /// # Returns
-    ///
-    /// The [`CredentialRecord`] associated with `credential_id`.
-    ///
-    /// # Panics
-    ///
-    /// * [`ContractError::CredentialNotFound`] if no credential exists for the
-    ///   given `credential_id`.
-    pub fn get_credential(env: Env, credential_id: Bytes) -> CredentialRecord {
-        let key = StorageKey::Credential(credential_id);
-
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| panic!("credential not found"))
+        Ok(record)
     }
 }
