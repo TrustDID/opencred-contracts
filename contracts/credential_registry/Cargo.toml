@@ -21,3 +21,7 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+
+[[test]]
+name = "integration_tests"
+path = "test/integration_tests.rs"

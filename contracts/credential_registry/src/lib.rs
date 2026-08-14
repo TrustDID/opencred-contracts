@@ -9,9 +9,9 @@
 //!    holder's address. The contract records the hash, issuer, holder, and a
 //!    ledger timestamp. The full credential document is stored off-chain on IPFS.
 //!
-//! 2. **Verification** — Any caller can query the registry by credential hash to
-//!    confirm it was issued by a known issuer, retrieve the holder address, and
-//!    check that it has not been revoked.
+//! 2. **Verification** — Any caller can call [`CredentialRegistry::get_credential`]
+//!    with a `credential_id` to confirm it was issued, retrieve the holder address,
+//!    and check that it has not been revoked.
 //!
 //! 3. **Revocation** — The original issuer can mark a credential hash as
 //!    revoked. Revocation is permanent and on-chain.
